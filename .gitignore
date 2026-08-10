@@ -1,0 +1,37 @@
+# idpdrift state — an inventory of privileged access in your tenant: who holds
+# which administrative role, which applications can read all mail, and which
+# conditional access policies have exclusions. Plus the pseudonymisation salt.
+# Never commit these.
+.idpdrift/
+state.json
+salt
+idp.yml
+report.md
+report.html
+report.json
+*.export.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store

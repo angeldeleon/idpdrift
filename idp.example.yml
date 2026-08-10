@@ -1,0 +1,133 @@
+# idpdrift configuration
+#
+# Copy to idp.yml and edit. Validate with:
+#     idpdrift validate -c idp.yml
+#
+# Unknown keys are a hard error, so a typo fails loudly rather than silently
+# disabling a check.
+
+source:
+  # Where identity state comes from. Every source is strictly read-only.
+  #   entra  — Microsoft Entra ID via Microsoft Graph
+  #   okta   — an Okta org via its API
+  #   file   — an exported JSON snapshot (see the README for the schema)
+  type: file
+
+  file:
+    # Lets you evaluate the tool, and run it in environments that will not let a
+    # scheduled job hold a directory token, without any credential at all.
+    path: tenant-export.json
+
+  # entra:
+  #   tenant_id: 00000000-0000-0000-0000-000000000000
+  #   client_id: 00000000-0000-0000-0000-000000000000
+  #   # The NAME of an environment variable, never the secret itself. A URL or
+  #   # path here is rejected, so a secret cannot be committed by accident.
+  #   client_secret_env: IDPDRIFT_ENTRA_CLIENT_SECRET
+  #   # Read-only scopes are sufficient: Directory.Read.All,
+  #   # RoleManagement.Read.Directory, Application.Read.All, Policy.Read.All,
+  #   # AuditLog.Read.All, UserAuthenticationMethod.Read.All. Each may be refused
+  #   # independently; whatever is refused is reported as indeterminate rather
+  #   # than as a clean result.
+  #   max_detail_lookups: 2000
+
+  # okta:
+  #   org_url: https://example.okta.com
+  #   api_token_env: OKTA_API_TOKEN
+  #   # Roles and factors are per-user endpoints in Okta. If this budget does not
+  #   # cover every account, both facets are reported as indeterminate rather
+  #   # than as "these accounts hold no roles".
+  #   max_detail_lookups: 2000
+
+privacy:
+  # pseudonymous (default) replaces account identifiers with stable labels in
+  # every report, alert and webhook payload. A report from this tool is a list of
+  # named employees and what they can do. See PRIVACY.md before changing this.
+  mode: pseudonymous
+
+policy:
+  # Custom roles cannot be classified from their name. Name yours here, either
+  # as a list (all treated as privileged) or as a mapping to an explicit tier:
+  # tenant_admin, privileged, sensitive, standard.
+  privileged_roles:
+    Break Glass Operator: tenant_admin
+    # Billing Reconciliation: sensitive
+
+  # Set true only if your tenant runs privileged identity management and standing
+  # assignments are meant to be the exception. On a tenant without it, every
+  # assignment is standing and reporting all of them says nothing.
+  expect_just_in_time: false
+
+  # No interactive sign-in inside this window counts as dormant.
+  dormant_days: 90
+
+  # Application credentials: warn this far ahead, and flag anything issued for
+  # longer than the maximum.
+  credential_expiry_days: 30
+  credential_max_lifetime_days: 365
+
+  # How much reach an external identity is allowed before it is a finding.
+  guest_role_allowance: 0
+  guest_group_allowance: 5
+
+  # Never reported at all. Principals are matched against the object id and the
+  # normalised user principal name; applications against the service principal
+  # object id and the application id.
+  #
+  # Deliberately not the display name. Whoever registers an application chooses
+  # that, so an entry naming one would let anybody who can create an application
+  # opt themselves out of the report by picking the right name — and out of the
+  # baseline with it, so drift never sees them appear either.
+  ignore_principals:
+    # - breakglass@example.onmicrosoft.com
+  ignore_applications:
+    # - 0000000a-0000-0000-c000-000000000000
+
+  # Third-party applications you have already reviewed and accepted, by
+  # application id for the same reason. Keeping this curated is what makes the
+  # next unreviewed consent grant stand out.
+  approved_applications:
+    # - 82b6a5a8-1a01-4b06-9f3e-2a3f0dd4a2b1
+
+settings:
+  checks:
+    - privileged_roles
+    - auth_strength
+    - dormancy
+    - service_principals
+    - oauth_grants
+    - guests
+    - conditional_access
+  fail_on: high
+  http_timeout: 30
+  max_identities: 100000
+  state_path: .idpdrift/state.json
+  salt_path: .idpdrift/salt
+
+notify:
+  # Environment variable NAMES, never the URLs.
+  # slack_webhook_url_env: SLACK_WEBHOOK_URL
+  # webhook_url_env: IDPDRIFT_WEBHOOK_URL
+  min_severity: high
+  max_findings_per_message: 20
+
+  # email:
+  #   smtp_host: smtp.example.com
+  #   smtp_port: 587
+  #   use_starttls: true
+  #   username_env: SMTP_USERNAME
+  #   password_env: SMTP_PASSWORD
+  #   from_address: idpdrift@example.com
+  #   to_addresses: [security@example.com]
+
+ai:
+  # Off by default, and it cannot change a finding: it runs after every finding,
+  # severity and exit code is final, and writes one prose paragraph. Enabling it
+  # sends finding titles and severities to a third-party API — never a display
+  # name, a user principal name or a tenant id.
+  enabled: false
+  provider: anthropic
+  model: claude-sonnet-4-5
+  api_key_env: ANTHROPIC_API_KEY
+  summarize: true
+  max_items: 40

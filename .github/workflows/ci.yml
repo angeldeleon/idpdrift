@@ -1,0 +1,293 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, so dependency advisories surface even when nothing is pushed.
+    - cron: "41 6 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Test
+        run: pytest -m "not network" --cov --cov-report=term-missing
+
+  lint:
+    name: lint and types
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Ruff (lint)
+        run: ruff check --output-format=github .
+      - name: Ruff (format)
+        run: ruff format --check .
+      - name: mypy
+        run: mypy
+
+  security:
+    name: security scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Bandit
+        run: bandit -r src/ -c pyproject.toml
+      - name: pip-audit
+        # Audit the project's declared dependencies, not the installed
+        # environment: the latter contains idpdrift itself as an editable
+        # install, which pip-audit cannot resolve on PyPI, and --strict treats
+        # an unauditable package as a hard failure.
+        run: pip-audit --strict --desc on .
+
+  invariants:
+    name: security invariants
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: The tool has no write path into a tenant
+        # A guard against a future PR quietly acquiring one. SECURITY.md makes a
+        # promise that a read-only credential is sufficient; this enforces it.
+        run: |
+          set -euo pipefail
+          if grep -rnE 'safe_request\(\s*"(POST|PUT|PATCH|DELETE)"' src/idpdrift/sources/ \
+             | grep -v 'oauth2/v2.0/token'; then
+            echo "::error::a source issues a non-GET request outside the token endpoint"; exit 1
+          fi
+          for forbidden in "requests.post" "httpx.post" "httpx.delete" "httpx.patch" "subprocess" "eval("; do
+            if grep -rqF -- "$forbidden" src/idpdrift/; then
+              echo "::error::source tree references '$forbidden'"; exit 1
+            fi
+          done
+          echo "no write path, no unguarded client, no subprocess"
+
+      - name: Config cannot supply an API path
+        run: |
+          set -euo pipefail
+          printf 'source:\n  type: okta\n  okta:\n    org_url: https://example.okta.com\n    path: /api/v1/users\n' > bad.yml
+          if idpdrift validate -c bad.yml 2>/dev/null; then
+            echo "::error::config accepted an endpoint key"; exit 1
+          fi
+          echo "config rejects endpoint keys"
+
+      - name: The example config validates offline
+        run: idpdrift validate -c idp.example.yml
+
+      - name: Every declared check is implemented and diffed
+        # A check an operator can name that no code implements is a permanently
+        # green, permanently blind scan. A check with no drift rule is a posture
+        # tool wearing a drift tool's name.
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import sys
+          from idpdrift.checks import registered_checks
+          from idpdrift.config import ALL_CHECKS
+          from idpdrift.drift import registered_rules
+          missing = sorted(set(ALL_CHECKS) - set(registered_checks()))
+          undiffed = sorted(set(ALL_CHECKS) - set(registered_rules()))
+          if missing:
+              sys.exit(f"checks declared but not implemented: {missing}")
+          if undiffed:
+              sys.exit(f"checks with no drift rule: {undiffed}")
+          print("every check is implemented and diffed")
+          PY
+
+      - name: Every catalog entry survives normalisation
+        # An entry that normalises to "" can never match, so the rule is dead
+        # code that still reads as coverage on the tin.
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import sys
+          from idpdrift.catalog import (
+              HIGH_IMPACT_SCOPES, PHISHING_RESISTANT_METHODS, ROLE_TIERS, WEAK_METHODS,
+          )
+          dead = [k for k in (
+              list(ROLE_TIERS) + list(HIGH_IMPACT_SCOPES)
+              + list(PHISHING_RESISTANT_METHODS) + list(WEAK_METHODS)
+          ) if not k]
+          if dead:
+              sys.exit("unreachable catalog entries found")
+          overlap = PHISHING_RESISTANT_METHODS & WEAK_METHODS
+          if overlap:
+              sys.exit(f"a method is both phishing-resistant and weak: {sorted(overlap)}")
+          print("all catalog entries reachable and consistent")
+          PY
+
+      - name: Nothing indeterminate can trip a severity threshold
+        # The tri-state promise, enforced rather than documented: a facet the
+        # source could not read must never sound like a discovered weakness.
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import sys
+          from idpdrift.models import Determination, Severity
+          from idpdrift.severity import BASE_SEVERITY, Issue, rate
+          missing = [i.value for i in Issue if i not in BASE_SEVERITY]
+          if missing:
+              sys.exit(f"issues with no band in the table: {missing}")
+          loud = [
+              i.value for i in Issue
+              if rate(i, determination=Determination.UNKNOWN) >= Severity.MEDIUM
+          ]
+          if loud:
+              sys.exit(f"indeterminate findings above the cap: {loud}")
+          print("every issue is in the table and capped when indeterminate")
+          PY
+
+  smoke:
+    name: end-to-end smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Baseline, then drift
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          export = {
+              "source": "entra", "tenant": "ci.example",
+              "principals": [{"id": "u1", "display_name": "Alice Admin",
+                              "user_principal_name": "alice@ci.example", "kind": "user",
+                              "enabled": True, "last_sign_in": "2026-08-09T09:00:00Z",
+                              "phishing_resistant": True, "second_factor": True,
+                              "auth_methods": ["fido2SecurityKey"], "group_count": 2}],
+              "role_assignments": [{"id": "ra1", "role_id": "r-ga",
+                                    "role_name": "Global Administrator",
+                                    "principal_id": "u1", "scope": "/", "standing": True}],
+              "service_principals": [], "oauth_grants": [],
+              "policies": [{"id": "p1", "display_name": "Require MFA", "state": "enabled"}],
+          }
+          open("export.json", "w").write(json.dumps(export))
+          PY
+          printf 'source:\n  type: file\n  file:\n    path: export.json\nsettings:\n  state_path: .idpdrift/state.json\n  salt_path: .idpdrift/salt\n' > ci.yml
+
+          idpdrift scan -c ci.yml -o run1.md --fail-on critical
+          grep -q "this run establishes the baseline" run1.md
+
+          python - <<'PY'
+          import json
+          export = json.load(open("export.json"))
+          export["role_assignments"].append(
+              {"id": "ra2", "role_id": "r-appadmin", "role_name": "Application Administrator",
+               "principal_id": "u1", "scope": "/", "standing": True})
+          open("export.json", "w").write(json.dumps(export))
+          PY
+
+          idpdrift scan -c ci.yml -o run2.md --no-save --fail-on high && rc=0 || rc=$?
+          test "$rc" -eq 1 || { echo "expected exit 1 for findings, got $rc"; exit 1; }
+          grep -q "Changes since last scan" run2.md
+          grep -q "Application Administrator" run2.md
+          echo "drift detection works end to end"
+
+      - name: An unreadable facet is reported, not read as absence
+        # The tri-state promise end to end: dropping the policies key must
+        # produce a coverage note, not a tenant full of missing controls.
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          export = json.load(open("export.json"))
+          export.pop("policies")
+          open("blind.json", "w").write(json.dumps(export))
+          PY
+          printf 'source:\n  type: file\n  file:\n    path: blind.json\nsettings:\n  state_path: .idpdrift/blind.json\n  salt_path: .idpdrift/salt\n' > blind.yml
+
+          idpdrift coverage -c blind.yml | tee coverage.txt
+          grep -q "access_policies.*COULD NOT DETERMINE" coverage.txt
+
+          idpdrift scan -c blind.yml -f json -o blind-report.json --no-save --fail-on critical
+          python - <<'PY'
+          import json, sys
+          report = json.load(open("blind-report.json"))
+          assert "access_policies" in report["indeterminate_facets"], "coverage gap not reported"
+          loud = [f for f in report["findings"]
+                  if f["determination"] == "unknown" and f["severity"] in ("medium", "high", "critical")]
+          assert not loud, f"indeterminate findings above the cap: {loud}"
+          print("indeterminate facets are reported and capped")
+          PY
+
+      - name: Pseudonymisation holds in JSON output
+        run: |
+          set -euo pipefail
+          idpdrift scan -c ci.yml -f json -o out.json --no-save --fail-on critical
+          for leak in "alice@ci.example" "Alice Admin"; do
+            if grep -qF -- "$leak" out.json; then
+              echo "::error::raw account identifier leaked into JSON output"; exit 1
+            fi
+          done
+          echo "pseudonymisation holds"
+
+      - name: A broken source exits 2, not 0
+        run: |
+          set -euo pipefail
+          printf 'source:\n  type: file\n  file:\n    path: /nonexistent.json\n' > broken.yml
+          idpdrift scan -c broken.yml >/dev/null 2>&1 && rc=0 || rc=$?
+          test "$rc" -eq 2 || { echo "expected exit 2, got $rc"; exit 1; }
+          echo "broken source fails loudly"
+
+      - name: The state file and reports are not world-readable
+        run: |
+          set -euo pipefail
+          for f in .idpdrift/state.json out.json; do
+            mode=$(stat -c '%a' "$f")
+            test "$mode" = "600" || { echo "::error::$f is mode $mode, expected 600"; exit 1; }
+          done
+          echo "state and reports are 0600"
